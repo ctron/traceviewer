@@ -78,6 +78,7 @@ fn event_loop(
                         target: Some("traceviewer".to_string()),
                         spans: Vec::new(),
                         message,
+                        message_parts: Vec::new(),
                         stream,
                     });
                     dirty = true;

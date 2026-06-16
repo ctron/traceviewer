@@ -1,12 +1,18 @@
 use crate::{
     cli::LogFormat,
-    model::{Level, LogEntry, Stream},
+    model::{Level, LogEntry, MessagePart, MessageStyle, Stream},
 };
+use serde_json::{Map, Value};
+
+const BUNYAN_CORE_FIELDS: &[&str] = &["name", "hostname", "pid", "level", "msg", "time", "v"];
 
 pub(crate) fn parse_log_line(format: LogFormat, stream: Stream, raw: String) -> LogEntry {
     let raw = strip_ansi_escape_sequences(&raw);
     let parsed = match format {
-        LogFormat::Auto => parse_tracing(&raw).or_else(|| parse_env_logger(&raw)),
+        LogFormat::Auto => parse_bunyan(&raw, stream)
+            .or_else(|| parse_tracing(&raw))
+            .or_else(|| parse_env_logger(&raw)),
+        LogFormat::Bunyan => parse_bunyan(&raw, stream),
         LogFormat::Plain => None,
         LogFormat::EnvLogger => parse_env_logger(&raw),
         LogFormat::Tracing => parse_tracing(&raw),
@@ -22,6 +28,7 @@ pub(crate) fn parse_log_line(format: LogFormat, stream: Stream, raw: String) -> 
         target: None,
         spans: Vec::new(),
         message: raw.clone(),
+        message_parts: Vec::new(),
         parsed: false,
         stream,
     })
@@ -96,6 +103,7 @@ fn parse_env_logger(raw: &str) -> Option<LogEntry> {
         target,
         spans: Vec::new(),
         message: message.to_string(),
+        message_parts: Vec::new(),
         stream: Stream::Stdout,
     })
 }
@@ -120,8 +128,122 @@ fn parse_tracing(raw: &str) -> Option<LogEntry> {
         target,
         spans,
         message,
+        message_parts: Vec::new(),
         stream: Stream::Stdout,
     })
+}
+
+fn parse_bunyan(raw: &str, stream: Stream) -> Option<LogEntry> {
+    let raw = raw.trim_end();
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let Value::Object(fields) = value else {
+        return None;
+    };
+
+    let level = parse_bunyan_level(fields.get("level")?)?;
+    let message = fields.get("msg")?.as_str()?.to_string();
+    let timestamp = fields
+        .get("time")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let target = fields
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let message_parts = bunyan_message_parts(&message, &fields);
+    let message = MessagePart::plain_text(&message_parts);
+
+    Some(LogEntry {
+        timestamp,
+        level,
+        parsed: true,
+        target,
+        spans: Vec::new(),
+        message,
+        message_parts,
+        stream,
+    })
+}
+
+fn parse_bunyan_level(value: &Value) -> Option<Level> {
+    if let Some(level) = value.as_i64() {
+        return match level {
+            10 => Some(Level::Trace),
+            20 => Some(Level::Debug),
+            30 => Some(Level::Info),
+            40 => Some(Level::Warn),
+            50 | 60 => Some(Level::Error),
+            _ => None,
+        };
+    }
+
+    value.as_str().and_then(parse_level)
+}
+
+fn bunyan_message_parts(message: &str, fields: &Map<String, Value>) -> Vec<MessagePart> {
+    let extras: Vec<_> = fields
+        .iter()
+        .filter(|(key, _)| !BUNYAN_CORE_FIELDS.contains(&key.as_str()))
+        .collect();
+
+    let mut parts = vec![MessagePart::new(message, MessageStyle::Default)];
+    if extras.is_empty() {
+        return parts;
+    }
+
+    parts.push(MessagePart::new(" (", MessageStyle::JsonPunctuation));
+    for (idx, (key, value)) in extras.iter().enumerate() {
+        if idx > 0 {
+            parts.push(MessagePart::new(" ", MessageStyle::JsonPunctuation));
+        }
+        parts.push(MessagePart::new(*key, MessageStyle::JsonKey));
+        parts.push(MessagePart::new("=", MessageStyle::JsonPunctuation));
+        push_json_value_parts(&mut parts, value);
+    }
+    parts.push(MessagePart::new(")", MessageStyle::JsonPunctuation));
+    parts
+}
+
+fn push_json_value_parts(parts: &mut Vec<MessagePart>, value: &Value) {
+    match value {
+        Value::Null => parts.push(MessagePart::new("null", MessageStyle::JsonNull)),
+        Value::Bool(value) => {
+            parts.push(MessagePart::new(value.to_string(), MessageStyle::JsonBool))
+        }
+        Value::Number(value) => parts.push(MessagePart::new(
+            value.to_string(),
+            MessageStyle::JsonNumber,
+        )),
+        Value::String(value) => parts.push(MessagePart::new(
+            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
+            MessageStyle::JsonString,
+        )),
+        Value::Array(values) => {
+            parts.push(MessagePart::new("[", MessageStyle::JsonArray));
+            for (idx, value) in values.iter().enumerate() {
+                if idx > 0 {
+                    parts.push(MessagePart::new(",", MessageStyle::JsonPunctuation));
+                }
+                push_json_value_parts(parts, value);
+            }
+            parts.push(MessagePart::new("]", MessageStyle::JsonArray));
+        }
+        Value::Object(fields) => {
+            parts.push(MessagePart::new("{", MessageStyle::JsonObject));
+            for (idx, (key, value)) in fields.iter().enumerate() {
+                if idx > 0 {
+                    parts.push(MessagePart::new(",", MessageStyle::JsonPunctuation));
+                }
+                parts.push(MessagePart::new(
+                    serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
+                    MessageStyle::JsonKey,
+                ));
+                parts.push(MessagePart::new(":", MessageStyle::JsonPunctuation));
+                push_json_value_parts(parts, value);
+            }
+            parts.push(MessagePart::new("}", MessageStyle::JsonObject));
+        }
+    }
 }
 
 fn take_token(value: &str) -> Option<(&str, &str)> {
@@ -434,6 +556,142 @@ mod tests {
     }
 
     #[test]
+    fn parses_bunyan_default_shape() {
+        let entry = parse_bunyan(
+            r#"{"name":"myapp","hostname":"banana.local","pid":40161,"level":30,"msg":"hi","time":"2013-01-04T18:46:23.851Z","v":0}"#,
+            Stream::Stdout,
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, Level::Info);
+        assert!(entry.parsed);
+        assert_eq!(entry.timestamp.as_deref(), Some("2013-01-04T18:46:23.851Z"));
+        assert_eq!(entry.target.as_deref(), Some("myapp"));
+        assert_eq!(entry.message, "hi");
+        assert_eq!(entry.stream, Stream::Stdout);
+        assert_eq!(
+            entry.message_parts,
+            vec![MessagePart::new("hi", MessageStyle::Default)]
+        );
+    }
+
+    #[test]
+    fn parses_bunyan_extra_fields_as_structured_message_parts() {
+        let entry = parse_bunyan(
+            r#"{"name":"myapp","hostname":"banana.local","pid":40161,"level":40,"lang":"fr","ok":true,"count":7,"msg":"au revoir","time":"2013-01-04T18:46:23.853Z","v":0}"#,
+            Stream::Stderr,
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, Level::Warn);
+        assert_eq!(entry.stream, Stream::Stderr);
+        assert_eq!(entry.message, r#"au revoir (lang="fr" ok=true count=7)"#);
+        assert_eq!(
+            entry.message_parts,
+            vec![
+                MessagePart::new("au revoir", MessageStyle::Default),
+                MessagePart::new(" (", MessageStyle::JsonPunctuation),
+                MessagePart::new("lang", MessageStyle::JsonKey),
+                MessagePart::new("=", MessageStyle::JsonPunctuation),
+                MessagePart::new("\"fr\"", MessageStyle::JsonString),
+                MessagePart::new(" ", MessageStyle::JsonPunctuation),
+                MessagePart::new("ok", MessageStyle::JsonKey),
+                MessagePart::new("=", MessageStyle::JsonPunctuation),
+                MessagePart::new("true", MessageStyle::JsonBool),
+                MessagePart::new(" ", MessageStyle::JsonPunctuation),
+                MessagePart::new("count", MessageStyle::JsonKey),
+                MessagePart::new("=", MessageStyle::JsonPunctuation),
+                MessagePart::new("7", MessageStyle::JsonNumber),
+                MessagePart::new(")", MessageStyle::JsonPunctuation),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_bunyan_nested_extra_fields_compactly() {
+        let entry = parse_bunyan(
+            r#"{"name":"myapp","level":30,"msg":"request","req":{"method":"GET","status":200},"tags":["api",null,false],"v":0}"#,
+            Stream::Stdout,
+        )
+        .expect("entry");
+
+        assert_eq!(
+            entry.message,
+            r#"request (req={"method":"GET","status":200} tags=["api",null,false])"#
+        );
+        assert!(
+            entry
+                .message_parts
+                .iter()
+                .any(|part| part.text == "null" && part.style == MessageStyle::JsonNull)
+        );
+        assert!(
+            entry
+                .message_parts
+                .iter()
+                .any(|part| part.text == "[" && part.style == MessageStyle::JsonArray)
+        );
+        assert!(
+            entry
+                .message_parts
+                .iter()
+                .any(|part| part.text == "{" && part.style == MessageStyle::JsonObject)
+        );
+    }
+
+    #[rstest]
+    #[case(10, Level::Trace)]
+    #[case(20, Level::Debug)]
+    #[case(30, Level::Info)]
+    #[case(40, Level::Warn)]
+    #[case(50, Level::Error)]
+    #[case(60, Level::Error)]
+    fn maps_bunyan_numeric_levels(#[case] bunyan_level: u8, #[case] level: Level) {
+        let entry = parse_bunyan(
+            &format!(r#"{{"level":{bunyan_level},"msg":"level test"}}"#),
+            Stream::Stdout,
+        )
+        .expect("entry");
+
+        assert_eq!(entry.level, level);
+    }
+
+    #[test]
+    fn parses_bunyan_string_level() {
+        let entry =
+            parse_bunyan(r#"{"level":"warn","msg":"careful"}"#, Stream::Stdout).expect("entry");
+
+        assert_eq!(entry.level, Level::Warn);
+    }
+
+    #[test]
+    fn auto_detects_bunyan_before_text_formats() {
+        let entry = parse_log_line(
+            LogFormat::Auto,
+            Stream::Stdout,
+            r#"{"level":30,"msg":"INFO my_crate: hello"}"#.to_string(),
+        );
+
+        assert!(entry.parsed);
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.message, "INFO my_crate: hello");
+        assert!(entry.target.is_none());
+    }
+
+    #[test]
+    fn invalid_bunyan_falls_back_to_unparsed_entry() {
+        let entry = parse_log_line(
+            LogFormat::Bunyan,
+            Stream::Stdout,
+            r#"{"level":30,"message":"missing msg"}"#.to_string(),
+        );
+
+        assert!(!entry.parsed);
+        assert_eq!(entry.level, Level::Unknown);
+        assert_eq!(entry.message, r#"{"level":30,"message":"missing msg"}"#);
+    }
+
+    #[test]
     fn plain_fallback_keeps_original_line() {
         let entry = parse_log_line(LogFormat::Auto, Stream::Stdout, "hello there".to_string());
 
@@ -452,6 +710,19 @@ mod tests {
 
         assert_eq!(entry.level, Level::Info);
         assert_eq!(entry.target.as_deref(), Some("my_crate"));
+        assert_eq!(entry.message, "hello");
+    }
+
+    #[test]
+    fn strips_ansi_sequences_before_bunyan_parsing() {
+        let entry = parse_log_line(
+            LogFormat::Bunyan,
+            Stream::Stdout,
+            "\u{1b}[32m{\"level\":30,\"msg\":\"hello\"}\u{1b}[0m".to_string(),
+        );
+
+        assert!(entry.parsed);
+        assert_eq!(entry.level, Level::Info);
         assert_eq!(entry.message, "hello");
     }
 }

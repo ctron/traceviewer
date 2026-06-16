@@ -12,7 +12,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 
-use crate::model::{Level, LogEntry, Stream};
+use crate::model::{Level, LogEntry, MessagePart, MessageStyle, Stream};
 
 #[derive(Debug, Default)]
 pub(crate) struct ViewState {
@@ -485,7 +485,12 @@ impl EntryRenderer {
         if self.options.show_spans {
             self.push_span_parts(&mut parts, &entry.spans);
         }
-        self.push_message_parts(&mut parts, &entry.message, message_color(entry));
+        self.push_message_parts(
+            &mut parts,
+            &entry.message,
+            &entry.message_parts,
+            message_color(entry),
+        );
         parts
     }
 
@@ -608,7 +613,21 @@ fn flush_span_token(
 }
 
 impl EntryRenderer {
-    fn push_message_parts(self, parts: &mut Vec<Part>, message: &str, base_color: Color) {
+    fn push_message_parts(
+        self,
+        parts: &mut Vec<Part>,
+        message: &str,
+        message_parts: &[MessagePart],
+        base_color: Color,
+    ) {
+        if !message_parts.is_empty() {
+            for part in message_parts {
+                let (color, bold) = message_part_style(part.style, base_color);
+                parts.push(Part::new(&part.text, color, bold));
+            }
+            return;
+        }
+
         let mut current = String::new();
         let mut chars = message.chars().peekable();
         let mut in_string = false;
@@ -811,6 +830,18 @@ fn string_color() -> Color {
     }
 }
 
+fn message_part_style(style: MessageStyle, base_color: Color) -> (Color, bool) {
+    match style {
+        MessageStyle::Default => (base_color, false),
+        MessageStyle::JsonArray | MessageStyle::JsonObject => (Color::Reset, true),
+        MessageStyle::JsonBool | MessageStyle::JsonNumber => (Color::Reset, false),
+        MessageStyle::JsonKey => (Color::Blue, true),
+        MessageStyle::JsonNull => (Color::DarkGrey, false),
+        MessageStyle::JsonPunctuation => (Color::DarkGrey, false),
+        MessageStyle::JsonString => (Color::Green, false),
+    }
+}
+
 fn span_name_color(span: &str) -> Color {
     span_palette_color(stable_hash(span) % SPAN_PALETTE_SIZE)
 }
@@ -955,6 +986,7 @@ mod tests {
                 target: None,
                 spans: Vec::new(),
                 message: format!("line {idx}"),
+                message_parts: Vec::new(),
                 stream: Stream::Stdout,
             })
             .collect()
@@ -968,6 +1000,7 @@ mod tests {
             target: None,
             spans: Vec::new(),
             message: "line".to_string(),
+            message_parts: Vec::new(),
             stream: Stream::Stdout,
         }
     }
@@ -980,6 +1013,7 @@ mod tests {
             target: target.map(str::to_string),
             spans: Vec::new(),
             message: message.to_string(),
+            message_parts: Vec::new(),
             stream: Stream::Stdout,
         }
     }
@@ -1172,6 +1206,7 @@ mod tests {
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
             message: "loaded \"user\"".to_string(),
+            message_parts: Vec::new(),
             stream: Stream::Stdout,
         }]);
         let state = ViewState {
@@ -1194,6 +1229,7 @@ mod tests {
             target: Some("my_crate::worker".to_string()),
             spans: vec!["request{id=7}".to_string()],
             message: "loaded \"user\"".to_string(),
+            message_parts: Vec::new(),
             stream: Stream::Stdout,
         }]);
         let state = ViewState {
@@ -1370,7 +1406,12 @@ mod tests {
     #[test]
     fn message_parts_highlight_quoted_strings() {
         let mut parts = Vec::new();
-        renderer().push_message_parts(&mut parts, "loaded \"user 42\" from cache", Color::White);
+        renderer().push_message_parts(
+            &mut parts,
+            "loaded \"user 42\" from cache",
+            &[],
+            Color::White,
+        );
 
         assert_eq!(parts[0], Part::new("loaded ", Color::White, false));
         assert_eq!(parts[1], Part::new("\"user 42\"", string_color(), false));
@@ -1380,13 +1421,56 @@ mod tests {
     #[test]
     fn message_parts_keep_escaped_quotes_inside_string() {
         let mut parts = Vec::new();
-        renderer().push_message_parts(&mut parts, "loaded \"user \\\"jonas\\\"\"", Color::White);
+        renderer().push_message_parts(
+            &mut parts,
+            "loaded \"user \\\"jonas\\\"\"",
+            &[],
+            Color::White,
+        );
 
         assert_eq!(parts[0], Part::new("loaded ", Color::White, false));
         assert_eq!(
             parts[1],
             Part::new("\"user \\\"jonas\\\"\"", string_color(), false)
         );
+    }
+
+    #[test]
+    fn structured_message_parts_use_jq_style_colors() {
+        let message_parts = vec![
+            MessagePart::new("au revoir", MessageStyle::Default),
+            MessagePart::new(" (", MessageStyle::JsonPunctuation),
+            MessagePart::new("lang", MessageStyle::JsonKey),
+            MessagePart::new("=", MessageStyle::JsonPunctuation),
+            MessagePart::new("\"fr\"", MessageStyle::JsonString),
+            MessagePart::new(" ", MessageStyle::JsonPunctuation),
+            MessagePart::new("ok", MessageStyle::JsonBool),
+            MessagePart::new("=", MessageStyle::JsonPunctuation),
+            MessagePart::new("true", MessageStyle::JsonBool),
+            MessagePart::new(" ", MessageStyle::JsonPunctuation),
+            MessagePart::new("count", MessageStyle::JsonNumber),
+            MessagePart::new("=", MessageStyle::JsonPunctuation),
+            MessagePart::new("7", MessageStyle::JsonNumber),
+            MessagePart::new(" ", MessageStyle::JsonPunctuation),
+            MessagePart::new("none", MessageStyle::JsonNull),
+            MessagePart::new("=", MessageStyle::JsonPunctuation),
+            MessagePart::new("null", MessageStyle::JsonNull),
+            MessagePart::new(")", MessageStyle::JsonPunctuation),
+        ];
+        let mut parts = Vec::new();
+
+        renderer().push_message_parts(&mut parts, "", &message_parts, Color::White);
+
+        assert_eq!(
+            EntryRenderer::plain_text_from_parts(&parts),
+            r#"au revoir (lang="fr" ok=true count=7 none=null)"#
+        );
+        assert_eq!(parts[0], Part::new("au revoir", Color::White, false));
+        assert_eq!(parts[2], Part::new("lang", Color::Blue, true));
+        assert_eq!(parts[4], Part::new("\"fr\"", Color::Green, false));
+        assert_eq!(parts[8], Part::new("true", Color::Reset, false));
+        assert_eq!(parts[12], Part::new("7", Color::Reset, false));
+        assert_eq!(parts[16], Part::new("null", Color::DarkGrey, false));
     }
 
     #[test]

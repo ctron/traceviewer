@@ -16,6 +16,7 @@ anyhow = "1.0.102"
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 
 [dev-dependencies]
 rstest = "0.26.1"

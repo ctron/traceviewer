@@ -57,7 +57,40 @@ pub(crate) struct LogEntry {
     pub(crate) target: Option<String>,
     pub(crate) spans: Vec<String>,
     pub(crate) message: String,
+    pub(crate) message_parts: Vec<MessagePart>,
     pub(crate) stream: Stream,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MessageStyle {
+    Default,
+    JsonArray,
+    JsonBool,
+    JsonKey,
+    JsonNull,
+    JsonNumber,
+    JsonObject,
+    JsonPunctuation,
+    JsonString,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MessagePart {
+    pub(crate) text: String,
+    pub(crate) style: MessageStyle,
+}
+
+impl MessagePart {
+    pub(crate) fn new(text: impl Into<String>, style: MessageStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+
+    pub(crate) fn plain_text(parts: &[Self]) -> String {
+        parts.iter().map(|part| part.text.as_str()).collect()
+    }
 }
 
 #[derive(Debug)]

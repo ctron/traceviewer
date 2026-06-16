@@ -7,7 +7,7 @@ use clap::{Parser, ValueEnum};
     trailing_var_arg = true
 )]
 pub(crate) struct Cli {
-    /// Log parser to use. Auto currently recognizes env_logger and tracing fmt defaults.
+    /// Log parser to use. Auto currently recognizes bunyan, env_logger, and tracing fmt defaults.
     #[arg(short, long, value_enum, default_value_t = LogFormat::Auto)]
     pub(crate) format: LogFormat,
 
@@ -23,6 +23,7 @@ pub(crate) struct Cli {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum LogFormat {
     Auto,
+    Bunyan,
     Plain,
     EnvLogger,
     Tracing,

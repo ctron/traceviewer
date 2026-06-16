@@ -30,12 +30,18 @@ The installed binary is named `tv`.
 ```sh
 tv -- cargo test
 tv --format tracing -- my-service
+tv --format bunyan -- node service.js
 tv --max-lines 5000 -- ./run.sh
 ```
 
-By default, `traceviewer` attempts to recognize common `env_logger` and
-`tracing` text output. Use `--format plain`, `--format env-logger`, or
-`--format tracing` to choose a parser explicitly.
+By default, `traceviewer` attempts to recognize supported formats automatically.
+Use `--format` to choose one explicitly:
+
+- `auto`: detect supported formats
+- `plain`: show lines without parsing
+- `bunyan`: Bunyan JSON records
+- `env-logger`: common `env_logger` text output
+- `tracing`: common `tracing` text output
 
 ## Controls
 
