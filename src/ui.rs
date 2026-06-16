@@ -191,7 +191,7 @@ pub(crate) fn draw(
     if state.help_visible {
         queue!(stdout, Hide, Clear(ClearType::All))?;
         draw_help_page(stdout, cols, content_rows)?;
-        let status = status_line(entries.len(), state, exit_status, cols as usize);
+        let status = status_line(entries, state, exit_status, cols as usize);
         queue!(
             stdout,
             MoveTo(0, rows.saturating_sub(1)),
@@ -247,7 +247,7 @@ pub(crate) fn draw(
         )?;
     }
 
-    let status = status_line(entries.len(), state, exit_status, cols as usize);
+    let status = status_line(entries, state, exit_status, cols as usize);
     queue!(
         stdout,
         MoveTo(0, rows.saturating_sub(1)),
@@ -775,13 +775,14 @@ fn selected_foreground(color: Color) -> Color {
 }
 
 fn status_line(
-    entries: usize,
+    entries: &VecDeque<LogEntry>,
     state: &ViewState,
     exit_status: Option<ExitStatus>,
     width: usize,
 ) -> String {
+    let entry_count = entries.len();
     let selected = state.selected.map(|idx| idx + 1).unwrap_or(0);
-    let follow = if state.selected.is_some_and(|idx| idx + 1 == entries) {
+    let follow = if state.selected.is_some_and(|idx| idx + 1 == entry_count) {
         " | auto-scroll"
     } else {
         ""
@@ -793,15 +794,32 @@ fn status_line(
     let focus = state
         .focus_target
         .as_deref()
-        .map(|target| format!(" | focus {target}"))
+        .map(|target| focus_status(entries, target))
         .unwrap_or_default();
 
     let status = format!(
         " {process} | line {selected}/{entries}{follow} | x={} | spans {}{focus} | ? help ",
         state.x_offset,
-        if state.show_spans { "on" } else { "off" }
+        if state.show_spans { "on" } else { "off" },
+        entries = entry_count
     );
     visible_slice(&format!("{status:<width$}"), 0, width)
+}
+
+fn focus_status(entries: &VecDeque<LogEntry>, target: &str) -> String {
+    let hidden = entries
+        .iter()
+        .filter(|entry| entry.target.as_deref() != Some(target))
+        .count();
+    let percent = hidden_percentage(hidden, entries.len());
+    format!(" | focus {target} ({hidden} hidden, {percent}%)")
+}
+
+fn hidden_percentage(hidden: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    (hidden * 100 + total / 2) / total
 }
 
 fn level_color(level: Level) -> Color {
@@ -1145,6 +1163,25 @@ mod tests {
 
         handle_key(key(KeyCode::Up), &entries, &mut state, false, 5);
         assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn focus_status_shows_hidden_line_count_and_percentage() {
+        let entries = VecDeque::from([
+            entry_with_target(Some("alpha"), "one"),
+            entry_with_target(Some("beta"), "two"),
+            entry_with_target(Some("alpha"), "three"),
+            entry_with_target(None, "plain"),
+        ]);
+        let state = ViewState {
+            selected: Some(2),
+            focus_target: Some("alpha".to_string()),
+            ..ViewState::new()
+        };
+
+        let status = status_line(&entries, &state, None, 120);
+
+        assert!(status.contains("focus alpha (2 hidden, 50%)"));
     }
 
     #[test]
