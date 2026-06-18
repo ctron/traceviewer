@@ -5,6 +5,7 @@ use crate::{
 use serde_json::{Map, Value};
 
 const BUNYAN_CORE_FIELDS: &[&str] = &["name", "hostname", "pid", "level", "msg", "time", "v"];
+const MAX_TRACING_FIELD_PARSE_STEPS: usize = 1024;
 
 pub(crate) fn parse_log_line(format: LogFormat, stream: Stream, raw: String) -> LogEntry {
     let raw = strip_ansi_escape_sequences(&raw);
@@ -204,6 +205,7 @@ fn parse_logfmt_fields(input: &str) -> Option<Vec<TraceValueField>> {
     let mut rest = input.trim_start();
 
     while !rest.is_empty() {
+        let previous_len = rest.len();
         let (key, after_key) = take_logfmt_key(rest)?;
         let after_eq = after_key.strip_prefix('=')?;
         let (value, tail) = take_logfmt_value(after_eq)?;
@@ -212,6 +214,9 @@ fn parse_logfmt_fields(input: &str) -> Option<Vec<TraceValueField>> {
             TraceValue::from_tracing_text(&value),
         ));
         rest = tail.trim_start();
+        if !rest.is_empty() && rest.len() >= previous_len {
+            return None;
+        }
     }
 
     Some(fields)
@@ -476,13 +481,19 @@ fn split_top_level(value: &str, separator: char) -> Vec<&str> {
 }
 
 fn split_tracing_message_fields(message: &str) -> Option<(String, Vec<TracingField>)> {
+    let mut budget = MAX_TRACING_FIELD_PARSE_STEPS;
+
     for (idx, _) in message.char_indices() {
+        if budget == 0 {
+            return None;
+        }
+
         if idx > 0 && !message[..idx].ends_with(char::is_whitespace) {
             continue;
         }
 
         let candidate = &message[idx..];
-        if let Some(fields) = parse_tracing_field_sequence(candidate) {
+        if let Some(fields) = parse_tracing_field_sequence_with_budget(candidate, &mut budget) {
             return Some((message[..idx].trim_end().to_string(), fields));
         }
     }
@@ -491,6 +502,15 @@ fn split_tracing_message_fields(message: &str) -> Option<(String, Vec<TracingFie
 }
 
 fn parse_tracing_field_sequence(value: &str) -> Option<Vec<TracingField>> {
+    let mut budget = MAX_TRACING_FIELD_PARSE_STEPS;
+    parse_tracing_field_sequence_with_budget(value, &mut budget)
+}
+
+fn parse_tracing_field_sequence_with_budget(
+    value: &str,
+    budget: &mut usize,
+) -> Option<Vec<TracingField>> {
+    *budget = budget.checked_sub(1)?;
     let value = value.trim_start();
     let (key, rest) = take_tracing_field_key(value)?;
 
@@ -512,7 +532,7 @@ fn parse_tracing_field_sequence(value: &str) -> Option<Vec<TracingField>> {
             return Some(vec![field]);
         }
 
-        if let Some(mut fields) = parse_tracing_field_sequence(tail) {
+        if let Some(mut fields) = parse_tracing_field_sequence_with_budget(tail, budget) {
             fields.insert(0, field);
             return Some(fields);
         }
@@ -836,6 +856,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_logfmt_empty_values_without_spinning() {
+        let entry =
+            parse_logfmt(r#"level=info msg= user_id=42 empty="#, Stream::Stdout).expect("entry");
+
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.message, r#"(user_id=42 empty=)"#);
+        assert_eq!(
+            entry.values,
+            vec![TraceValueSection::new(
+                "event",
+                vec![
+                    TraceValueField::new("user_id", TraceValue::Number("42".to_string())),
+                    TraceValueField::new("empty", TraceValue::Other(String::new())),
+                ]
+            )]
+        );
+    }
+
+    #[test]
     fn invalid_logfmt_falls_back_to_unparsed_entry() {
         let entry = parse_log_line(
             LogFormat::Logfmt,
@@ -1087,6 +1126,20 @@ mod tests {
                 ]
             )]
         );
+    }
+
+    #[test]
+    fn tracing_field_parser_gives_up_on_long_malformed_field_runs() {
+        let fields = (0..2_000)
+            .map(|idx| format!("field{idx}="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = format!("2026-06-15T12:01:02Z INFO svc: {fields}");
+        let entry = parse_tracing(&line).expect("entry");
+
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.message, fields);
+        assert!(entry.values.is_empty());
     }
 
     #[test]
