@@ -481,64 +481,127 @@ fn split_top_level(value: &str, separator: char) -> Vec<&str> {
 }
 
 fn split_tracing_message_fields(message: &str) -> Option<(String, Vec<TracingField>)> {
-    let mut budget = MAX_TRACING_FIELD_PARSE_STEPS;
-
-    for (idx, _) in message.char_indices() {
-        if budget == 0 {
-            return None;
-        }
-
-        if idx > 0 && !message[..idx].ends_with(char::is_whitespace) {
-            continue;
-        }
-
-        let candidate = &message[idx..];
-        if let Some(fields) = parse_tracing_field_sequence_with_budget(candidate, &mut budget) {
-            return Some((message[..idx].trim_end().to_string(), fields));
-        }
-    }
-
-    None
+    TracingFieldParser::new().split_message_fields(message)
 }
 
 fn parse_tracing_field_sequence(value: &str) -> Option<Vec<TracingField>> {
-    let mut budget = MAX_TRACING_FIELD_PARSE_STEPS;
-    parse_tracing_field_sequence_with_budget(value, &mut budget)
+    TracingFieldParser::new().parse_sequence(value)
 }
 
-fn parse_tracing_field_sequence_with_budget(
-    value: &str,
-    budget: &mut usize,
-) -> Option<Vec<TracingField>> {
-    *budget = budget.checked_sub(1)?;
-    let value = value.trim_start();
-    let (key, rest) = take_tracing_field_key(value)?;
+struct TracingFieldParser {
+    budget: usize,
+}
 
-    for end in tracing_value_end_candidates(rest) {
-        let field_value = rest[..end].trim_end();
-        if field_value.is_empty() {
-            continue;
-        }
-
-        let tail = rest[end..].trim_start();
-        let field = TracingField {
-            key: key.to_string(),
-            value: TraceValue::from_tracing_text(field_value),
-        };
-        if tail.is_empty() {
-            if unquoted_value_has_top_level_whitespace(field_value) {
-                continue;
-            }
-            return Some(vec![field]);
-        }
-
-        if let Some(mut fields) = parse_tracing_field_sequence_with_budget(tail, budget) {
-            fields.insert(0, field);
-            return Some(fields);
+impl TracingFieldParser {
+    fn new() -> Self {
+        Self {
+            budget: MAX_TRACING_FIELD_PARSE_STEPS,
         }
     }
 
-    None
+    fn exhausted(&self) -> bool {
+        self.budget == 0
+    }
+
+    fn consume_step(&mut self) -> Option<()> {
+        self.budget = self.budget.checked_sub(1)?;
+        Some(())
+    }
+
+    fn split_message_fields(&mut self, message: &str) -> Option<(String, Vec<TracingField>)> {
+        for (idx, _) in message.char_indices() {
+            if self.exhausted() {
+                return None;
+            }
+
+            if idx > 0 && !message[..idx].ends_with(char::is_whitespace) {
+                continue;
+            }
+
+            let candidate = &message[idx..];
+            if let Some(fields) = self.parse_sequence(candidate) {
+                return Some((message[..idx].trim_end().to_string(), fields));
+            }
+        }
+
+        None
+    }
+
+    fn parse_sequence(&mut self, value: &str) -> Option<Vec<TracingField>> {
+        self.consume_step()?;
+        let value = value.trim_start();
+        let (key, rest) = take_tracing_field_key(value)?;
+
+        for end in self.value_end_candidates(rest) {
+            self.consume_step()?;
+            let field_value = rest[..end].trim_end();
+            if field_value.is_empty() {
+                continue;
+            }
+
+            let tail = rest[end..].trim_start();
+            let field = TracingField {
+                key: key.to_string(),
+                value: TraceValue::from_tracing_text(field_value),
+            };
+            if tail.is_empty() {
+                if unquoted_value_has_top_level_whitespace(field_value) {
+                    continue;
+                }
+                return Some(vec![field]);
+            }
+
+            if let Some(mut fields) = self.parse_sequence(tail) {
+                fields.insert(0, field);
+                return Some(fields);
+            }
+        }
+
+        None
+    }
+
+    fn value_end_candidates(&mut self, value: &str) -> Vec<usize> {
+        if value.starts_with('"') {
+            return quoted_value_end(value)
+                .map(|end| vec![end])
+                .unwrap_or_default();
+        }
+
+        let mut ends = Vec::new();
+        let mut depth = 0usize;
+        let mut in_quote = false;
+        let mut escaped = false;
+
+        for (idx, ch) in value.char_indices() {
+            if in_quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_quote = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_quote = true,
+                '{' | '[' | '(' => depth = depth.saturating_add(1),
+                '}' | ']' | ')' => depth = depth.saturating_sub(1),
+                ch if ch.is_whitespace() && depth == 0 => {
+                    if self.exhausted() {
+                        return ends;
+                    }
+                    self.budget -= 1;
+                    ends.push(idx);
+                }
+                _ => {}
+            }
+        }
+
+        ends.push(value.len());
+        ends
+    }
 }
 
 fn unquoted_value_has_top_level_whitespace(value: &str) -> bool {
@@ -591,43 +654,6 @@ fn take_tracing_field_key(value: &str) -> Option<(&str, &str)> {
     }
 
     None
-}
-
-fn tracing_value_end_candidates(value: &str) -> Vec<usize> {
-    if value.starts_with('"') {
-        return quoted_value_end(value)
-            .map(|end| vec![end])
-            .unwrap_or_default();
-    }
-
-    let mut ends = Vec::new();
-    let mut depth = 0usize;
-    let mut in_quote = false;
-    let mut escaped = false;
-
-    for (idx, ch) in value.char_indices() {
-        if in_quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_quote = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_quote = true,
-            '{' | '[' | '(' => depth = depth.saturating_add(1),
-            '}' | ']' | ')' => depth = depth.saturating_sub(1),
-            ch if ch.is_whitespace() && depth == 0 => ends.push(idx),
-            _ => {}
-        }
-    }
-
-    ends.push(value.len());
-    ends
 }
 
 fn quoted_value_end(value: &str) -> Option<usize> {
@@ -912,6 +938,62 @@ mod tests {
         );
         assert_eq!(entry.target.as_deref(), Some("my_crate::worker"));
         assert_eq!(entry.message, "retrying request");
+    }
+
+    #[test]
+    fn parses_tracing_line_at_default_max_line_bytes() {
+        const DEFAULT_MAX_LINE_BYTES: usize = 65_536;
+
+        let prefix = "2026-06-15T12:01:02Z INFO svc: ";
+        let message = "x".repeat(DEFAULT_MAX_LINE_BYTES - prefix.len());
+        let line = format!("{prefix}{message}");
+
+        let entry = parse_log_line(LogFormat::Tracing, Stream::Stdout, line);
+
+        assert_eq!(entry.raw.len(), DEFAULT_MAX_LINE_BYTES);
+        assert!(entry.parsed);
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.target.as_deref(), Some("svc"));
+        assert_eq!(entry.message, message);
+    }
+
+    #[test]
+    fn tracing_field_parser_handles_default_sized_malformed_field_run() {
+        const DEFAULT_MAX_LINE_BYTES: usize = 65_536;
+
+        let prefix = "2026-06-15T12:01:02Z INFO svc: key=";
+        let mut message = "x ".repeat((DEFAULT_MAX_LINE_BYTES - prefix.len()) / 2);
+        message.push_str(&"x".repeat(DEFAULT_MAX_LINE_BYTES - prefix.len() - message.len()));
+        let line = format!("{prefix}{message}");
+
+        let entry = parse_log_line(LogFormat::Tracing, Stream::Stdout, line);
+
+        assert_eq!(entry.raw.len(), DEFAULT_MAX_LINE_BYTES);
+        assert!(entry.parsed);
+        assert_eq!(entry.level, Level::Info);
+        assert_eq!(entry.target.as_deref(), Some("svc"));
+        assert_eq!(entry.message, format!("key={message}"));
+        assert!(entry.values.is_empty());
+    }
+
+    #[test]
+    fn tracing_field_parser_handles_default_sized_truncated_struct_list() {
+        const DEFAULT_MAX_LINE_BYTES: usize = 65_536;
+
+        let prefix = "2026-06-19T07:13:35Z TRACE svc: result=[";
+        let item = r#"RankedSbom { matched_sbom_id: 019bbe7c-c5b7-75d3-b1ae-135527636ed3, matched_name: "requests", top_ancestor_sbom: 00000000-0000-0000-0000-000000000000, cpe_id: 0bdc06dc-647c-57ef-8060-5d824fb5a656, sbom_date: 2025-12-15T10:41:21+00:00, rank: Some(107) }, "#;
+        let mut message = item.repeat((DEFAULT_MAX_LINE_BYTES - prefix.len()) / item.len());
+        message.push_str(&item[..DEFAULT_MAX_LINE_BYTES - prefix.len() - message.len()]);
+        let line = format!("{prefix}{message}");
+
+        let entry = parse_log_line(LogFormat::Tracing, Stream::Stdout, line);
+
+        assert_eq!(entry.raw.len(), DEFAULT_MAX_LINE_BYTES);
+        assert!(entry.parsed);
+        assert_eq!(entry.level, Level::Trace);
+        assert_eq!(entry.target.as_deref(), Some("svc"));
+        assert_eq!(entry.message, format!("(result=[{message})"));
+        assert_eq!(entry.values.len(), 1);
     }
 
     #[test]
