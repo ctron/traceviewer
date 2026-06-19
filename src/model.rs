@@ -216,6 +216,7 @@ fn push_fields_text(text: &mut String, fields: &[TraceValueField]) {
 #[derive(Debug)]
 pub(crate) enum AppEvent {
     Line(Stream, String),
+    InputFinished,
     ProcessExited(ExitStatus),
     ReaderFailed(Stream, String),
 }

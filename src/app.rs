@@ -1,9 +1,10 @@
 use std::{
     collections::VecDeque,
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use crossterm::{
     event::{self, Event},
     terminal,
@@ -14,23 +15,23 @@ use crate::{
     clipboard::copy_to_clipboard,
     model::{AppEvent, Level, LogEntry},
     parser::parse_log_line,
-    process::{RunningCommand, spawn_command},
+    process::{InputSource, RunningInput, spawn_input},
     terminal::TerminalGuard,
     ui::{KeyAction, ViewState, content_rows, draw, handle_key, selected_line_text},
 };
 
-pub(crate) fn run(cli: Cli) -> Result<()> {
-    if cli.max_lines == Some(0) {
-        bail!("--max-lines must be greater than zero");
-    }
-    if cli.max_line_bytes == 0 {
-        bail!("--max-line-bytes must be greater than zero");
-    }
+const MAX_EVENTS_PER_TICK: usize = 1024;
 
-    let command = spawn_command(&cli.command, cli.max_line_bytes)?;
+pub(crate) fn run(cli: Cli) -> Result<()> {
+    let source = if let Some(file) = &cli.file {
+        InputSource::File(file)
+    } else {
+        InputSource::Command(&cli.command)
+    };
+    let input = spawn_input(source, cli.max_line_bytes)?;
 
     let terminal = TerminalGuard::enter()?;
-    let result = event_loop(&terminal, &command, cli.format, cli.max_lines);
+    let result = event_loop(&terminal, &input, cli.format, cli.max_lines);
     terminal.leave()?;
 
     result
@@ -38,27 +39,31 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
 
 fn event_loop(
     terminal: &TerminalGuard,
-    command: &RunningCommand,
+    input: &RunningInput,
     format: LogFormat,
-    max_lines: Option<usize>,
+    max_lines: Option<NonZeroUsize>,
 ) -> Result<()> {
     let mut entries = VecDeque::new();
     let mut state = ViewState::new();
     let mut exit_status = None;
+    let mut input_finished = false;
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut dirty = true;
 
     loop {
         let page_size = content_rows(terminal::size()?.1, &state);
 
-        while let Ok(app_event) = command.events.try_recv() {
+        for _ in 0..MAX_EVENTS_PER_TICK {
+            let Ok(app_event) = input.events.try_recv() else {
+                break;
+            };
             match app_event {
                 AppEvent::Line(stream, line) => {
                     let was_following_latest = state
                         .selected
                         .is_none_or(|selected| selected + 1 == entries.len());
 
-                    if max_lines.is_some_and(|max_lines| entries.len() == max_lines) {
+                    if max_lines.is_some_and(|max_lines| entries.len() == max_lines.get()) {
                         entries.pop_front();
                         state.remove_first_line();
                     }
@@ -70,6 +75,10 @@ fn event_loop(
                 }
                 AppEvent::ProcessExited(status) => {
                     exit_status = Some(status);
+                    dirty = true;
+                }
+                AppEvent::InputFinished => {
+                    input_finished = true;
                     dirty = true;
                 }
                 AppEvent::ReaderFailed(stream, err) => {
@@ -92,8 +101,8 @@ fn event_loop(
         }
 
         if dirty && last_draw.elapsed() >= Duration::from_millis(16) {
-            let mut stdout = terminal.stdout();
-            draw(&mut *stdout, &entries, &state, exit_status)?;
+            let mut stdout = terminal.stdout()?;
+            draw(&mut *stdout, &entries, &state, exit_status, input_finished)?;
             last_draw = Instant::now();
             dirty = false;
         }
@@ -101,7 +110,13 @@ fn event_loop(
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
-            match handle_key(key, &entries, &mut state, exit_status.is_some(), page_size) {
+            match handle_key(
+                key,
+                &entries,
+                &mut state,
+                exit_status.is_some() || input_finished,
+                page_size,
+            ) {
                 KeyAction::Continue => {}
                 KeyAction::CopySelected => {
                     if let Some(line) = selected_line_text(&entries, &state) {
@@ -109,8 +124,8 @@ fn event_loop(
                     }
                 }
                 KeyAction::Quit => {
-                    if exit_status.is_none() {
-                        command.terminate();
+                    if exit_status.is_none() && !input_finished {
+                        input.terminate();
                     }
                     break;
                 }

@@ -32,6 +32,7 @@ tv -- cargo test
 tv --format tracing -- my-service
 tv --format bunyan -- node service.js
 tv --format logfmt -- ./service
+tv --file app.log
 ```
 
 Supported formats:

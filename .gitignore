@@ -1,4 +1,5 @@
 /target/
+/debug/
 /.codex/
 /.agents/
 /.idea/
