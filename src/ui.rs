@@ -1822,16 +1822,26 @@ fn status_line(
     let focus = focus_status(entries, state);
     let levels = LevelCounts::from_entries(entries, state).summary();
     let search = search_status(entries, state);
+    let display = display_status(state);
 
     let status = format!(
-        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | {} | x={} | threads {} | spans {} | raw {} | ? help ",
+        " {process} | line {selected}/{entries}{follow}{focus}{search} | lvl {levels} | {} | x={}{display} | raw {} | ? help ",
         state.level_filter.status_label(),
         state.x_offset,
-        if state.show_threads { "on" } else { "off" },
-        if state.show_spans { "on" } else { "off" },
         if state.show_raw { "on" } else { "off" },
         entries = entry_count
     );
+    status
+}
+
+fn display_status(state: &ViewState) -> String {
+    let mut status = String::new();
+    if !state.show_threads {
+        status.push_str(" | threads off");
+    }
+    if !state.show_spans {
+        status.push_str(" | spans off");
+    }
     status
 }
 
@@ -3195,6 +3205,32 @@ mod tests {
 
         assert!(status.contains("lvl ?1 T1 D1 I1 W1 E1"));
         assert!(status.contains("| WARN+ |"));
+    }
+
+    #[test]
+    fn status_omits_thread_and_span_state_when_enabled() {
+        let entries = entries(1);
+        let state = ViewState::new();
+
+        let status = status_line(&entries, &state, None, false);
+
+        assert!(!status.contains("threads on"));
+        assert!(!status.contains("spans on"));
+    }
+
+    #[test]
+    fn status_shows_thread_and_span_state_when_disabled() {
+        let entries = entries(1);
+        let state = ViewState {
+            show_threads: false,
+            show_spans: false,
+            ..ViewState::new()
+        };
+
+        let status = status_line(&entries, &state, None, false);
+
+        assert!(status.contains("threads off"));
+        assert!(status.contains("spans off"));
     }
 
     #[test]
